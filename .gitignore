@@ -1,0 +1,7 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pt
+*.pth
+*.h5
+wandb/
+.DS_Store
