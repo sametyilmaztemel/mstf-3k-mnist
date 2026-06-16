@@ -1,0 +1,10 @@
+model:
+  name: resnet18
+  num_classes: 10
+training:
+  epochs: 30
+  batch_size: 128
+  lr: 0.001
+dataset:
+  root: ./data
+  name: mnist
