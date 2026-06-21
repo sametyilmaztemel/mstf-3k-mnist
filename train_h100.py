@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 
-from kymatio.scattering2d.frontend.torch_frontend import ScatteringTorch2D
+from kymatio.torch import Scattering2D
 
 CACHE_DIR = "/home/samet/projects/tinycml-mnist3k/cache"
 DATA_PATH = "/home/samet/projects/tinycml-mnist3k/mnist.npz"
@@ -91,19 +91,19 @@ def precompute_wst(x_train, x_test, J=2, L=4, batch=512):
         out_test = np.load(scat_test_path)
     else:
         print(f"  Computing WST J={J}, L={L} (CPU/GPU mode)...")
-        s = ScatteringTorch2D(J=J, L=L, shape=(28,28)).eval().to(DEVICE)
-        out_train = np.zeros((len(x_train), s(torch.zeros(1,1,28,28).to(DEVICE)).shape[2], 7, 7), dtype=np.float32)
+        s = Scattering2D(J=J, L=L, shape=(28,28)).to(DEVICE)
+        out_train = np.zeros((len(x_train), s(torch.zeros(1,1,28,28).to(DEVICE)).shape[1], 7, 7), dtype=np.float32)
         out_test = np.zeros((len(x_test), out_train.shape[1], 7, 7), dtype=np.float32)
         with torch.no_grad():
             t0 = time.time()
             for i in range(0, len(x_train), batch):
                 xb = torch.from_numpy(x_train[i:i+batch]).unsqueeze(1).to(DEVICE)
-                out_train[i:i+batch] = s(xb).squeeze(1).cpu().numpy()
+                out_train[i:i+batch] = s(xb).cpu().numpy()
             print(f"    train ({len(x_train)}): {time.time()-t0:.1f}s")
             t0 = time.time()
             for i in range(0, len(x_test), batch):
                 xb = torch.from_numpy(x_test[i:i+batch]).unsqueeze(1).to(DEVICE)
-                out_test[i:i+batch] = s(xb).squeeze(1).cpu().numpy()
+                out_test[i:i+batch] = s(xb).cpu().numpy()
             print(f"    test ({len(x_test)}): {time.time()-t0:.1f}s")
         np.save(scat_train_path, out_train)
         np.save(scat_test_path, out_test)
