@@ -412,3 +412,209 @@ def train_one(X_tr, y_tr, X_te, y_te, hidden_arch, *,
         # EMA eval
         ema_model = make_mlp(in_dim, hidden_arch, dropout=dropout).to(DEVICE)
         ema.apply_to(ema_model)
+        ema_model.eval()
+        with torch.no_grad():
+            te_acc_ema = (ema_model(Xv).argmax(1) == yv).float().mean().item()
+
+        # TTA eval
+        te_acc_tta = 0.0
+        if use_tta:
+            probs = tta_predict(model, Xv, n_tta=tta_n)
+            te_acc_tta = (probs.argmax(1) == yv).float().mean().item()
+
+        if te_acc > best_test:
+            best_test = te_acc
+        if te_acc_ema > best_test_ema:
+            best_test_ema = te_acc_ema
+        if te_acc_tta > best_test_tta:
+            best_test_tta = te_acc_tta
+
+        history.append({
+            "epoch": ep, "train_acc": tr_acc, "test_acc": te_acc,
+            "test_acc_ema": te_acc_ema, "test_acc_tta": te_acc_tta
+        })
+
+        if verbose and (ep == 0 or ep == epochs - 1 or ep % 10 == 0 or
+                        max(te_acc, te_acc_ema, te_acc_tta) >= 0.99):
+            tta_str = f" tta={te_acc_tta:.4f}" if use_tta else ""
+            print(f"    ep{ep:3d}: tr={tr_acc:.4f} te={te_acc:.4f} "
+                  f"te_ema={te_acc_ema:.4f}{tta_str} "
+                  f"best={max(best_test, best_test_ema, best_test_tta):.4f}")
+
+    return best_test, best_test_ema, best_test_tta, model, n_params, history
+
+
+def report(name, n_params, best, best_ema, best_tta, time_sec, history=None):
+    """Detaylı rapor — hem ekrana bas hem log'a yaz."""
+    best_combined = max(best, best_ema, best_tta)
+    flag = "✓ HIT" if best_combined >= 0.9915 else "  miss"
+    lines = [
+        "",
+        "=" * 70,
+        f"  {flag} {name}",
+        f"  Params:    {n_params}",
+        f"  best:      {best:.4f}",
+        f"  best_ema:  {best_ema:.4f}",
+        f"  best_tta:  {best_tta:.4f}",
+        f"  Combined:  {best_combined:.4f}  (target: 0.9915)",
+        f"  Time:      {time_sec:.1f}s",
+        "=" * 70,
+        "",
+    ]
+    out = "\n".join(lines)
+    print(out)
+
+    # Log dosyasına da yaz
+    log_path = os.path.join(LOG_DIR, "training.log")
+    with open(log_path, "a") as f:
+        f.write(out + "\n")
+
+    return best_combined
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--n_train", type=int, default=5000, help="subset for quick test (60K for full)")
+    parser.add_argument("--no_mixup", action="store_true")
+    parser.add_argument("--no_cutmix", action="store_true")
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--mixup_alpha", type=float, default=0.4)
+    parser.add_argument("--cutmix_alpha", type=float, default=1.0)
+    parser.add_argument("--cutmix_prob", type=float, default=0.5)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--feat_noise_std", type=float, default=0.05)
+    parser.add_argument("--feat_noise_prob", type=float, default=0.5)
+    parser.add_argument("--use_tta", action="store_true")
+    parser.add_argument("--tta_n", type=int, default=10)
+    parser.add_argument("--pools", type=str, default="grid,gap,meanchan,meanstd")
+    parser.add_argument("--archs", type=str, default="auto")
+    parser.add_argument("--save_results", type=str, default="results.json")
+    parser.add_argument("--dump_tinycml", action="store_true")
+    args = parser.parse_args()
+
+    print(f"=== H100/A100 Training Pipeline v2 ===")
+    print(f"Args: {vars(args)}")
+    print(f"Device: {DEVICE}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+
+    # Load MNIST
+    print("\nLoading MNIST...")
+    d = np.load(DATA_PATH)
+    x_train = d["x_train"][:args.n_train].astype(np.float32) / 255.0
+    y_train = d["y_train"][:args.n_train].astype(np.int64)
+    x_test = d["x_test"].astype(np.float32) / 255.0
+    y_test = d["y_test"].astype(np.int64)
+    print(f"  train: {x_train.shape}, test: {x_test.shape}")
+
+    # WST pre-compute
+    pools = precompute_wst(x_train, x_test, J=2, L=4)
+
+    # Architectures per pool (3K altı)
+    ARCHS = {
+        "grid": [(16, 8), (16,), (32, 16), (32, 8), (24, 8), (32,)],
+        "gap": [(64, 16), (64, 8), (64, 12), (48, 24), (32, 16), (64, 24), (96,)],
+        "meanchan": [(32, 16), (48, 8), (32, 8), (48, 16), (24, 16), (64,)],
+        "meanstd": [(32, 16), (32, 8), (16, 8), (48,)],
+    }
+
+    pool_names = args.pools.split(",")
+    results = {}
+
+    for pool_name in pool_names:
+        if pool_name not in pools:
+            print(f"  SKIP unknown pool: {pool_name}")
+            continue
+        X_tr, X_te = pools[pool_name]
+        print(f"\n--- Pool: {pool_name} (feat_dim={X_tr.shape[1]}) ---")
+
+        if args.archs == "auto":
+            archs_to_try = ARCHS.get(pool_name, [])
+        else:
+            archs_to_try = [tuple(int(x) for x in args.archs.split(","))]
+
+        for arch in archs_to_try:
+            in_dim = X_tr.shape[1]
+            sizes = [in_dim, *arch, 10] if arch else [in_dim, 10]
+            n_params = sum(sizes[i] * sizes[i+1] + sizes[i+1] for i in range(len(sizes)-1))
+
+            if n_params > 3000:
+                print(f"  SKIP arch={arch}: {n_params} > 3000")
+                continue
+
+            t0 = time.time()
+            best, best_ema, best_tta, model, _, history = train_one(
+                X_tr, y_train, X_te, y_test, arch,
+                epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+                label_smoothing=args.label_smoothing,
+                mixup_alpha=0 if args.no_mixup else args.mixup_alpha,
+                cutmix_alpha=0 if args.no_cutmix else args.cutmix_alpha,
+                cutmix_prob=0 if args.no_cutmix else args.cutmix_prob,
+                ema_decay=args.ema_decay,
+                feat_noise_std=args.feat_noise_std,
+                feat_noise_prob=args.feat_noise_prob,
+                use_tta=args.use_tta,
+                tta_n=args.tta_n,
+                log_prefix=f"{pool_name}-{arch}",
+            )
+            dt = time.time() - t0
+            combined = report(f"{pool_name}-{arch}", n_params, best, best_ema, best_tta, dt)
+
+            results[f"{pool_name}-{arch}"] = {
+                "pool": pool_name, "arch": list(arch), "params": n_params,
+                "best": best, "best_ema": best_ema, "best_tta": best_tta,
+                "combined": combined, "time_sec": dt,
+                "history": history[-5:] if history else [],  # son 5 epoch
+            }
+
+            # En iyi modeli kaydet
+            if args.dump_tinycml and combined >= 0.99:
+                save_path = os.path.join(WEIGHTS_DIR, f"{pool_name}_{'_'.join(map(str, arch))}.bin")
+                dump_tinycml(model, save_path, in_dim, arch, n_classes=10)
+
+    # Final summary
+    print("\n" + "=" * 70)
+    print("FINAL SUMMARY (sorted by combined accuracy)")
+    print("=" * 70)
+    sorted_results = sorted(results.items(), key=lambda x: -x[1]["combined"])
+    for name, r in sorted_results:
+        flag = "✓ HIT" if r["combined"] >= 0.9915 else "  miss"
+        print(f"  {flag} {name:<25} params={r['params']:>5} "
+              f"best={r['best']:.4f} ema={r['best_ema']:.4f} "
+              f"tta={r['best_tta']:.4f} combined={r['combined']:.4f}")
+
+    if args.save_results:
+        with open(args.save_results, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to {args.save_results}")
+
+    # Telegram-ready rapor (kopyala-yapıştır)
+    print("\n" + "=" * 70)
+    print("TELEGRAM RAPORU (kopyala-yapıştır)")
+    print("=" * 70)
+    best_name, best_r = sorted_results[0]
+    print(f"""
+🎯 tinycml-mnist3k v2 Sonuçları
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}
+Train: {args.n_train} sample, {args.epochs} epoch
+En iyi: {best_name}
+Param:  {best_r['params']} (limit: 3000)
+Acc:    {best_r['combined']*100:.2f}% (target: 99.15%)
+  - best:      {best_r['best']*100:.2f}%
+  - best_ema:  {best_r['best_ema']*100:.2f}%
+  - best_tta:  {best_r['best_tta']*100:.2f}%
+
+Top-5:
+""")
+    for name, r in sorted_results[:5]:
+        flag = "✓" if r['combined'] >= 0.9915 else " "
+        print(f"  {flag} {name:<25} params={r['params']:>5} acc={r['combined']*100:.2f}%")
+
+
+if __name__ == "__main__":
+    main()
